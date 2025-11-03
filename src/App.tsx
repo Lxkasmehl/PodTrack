@@ -1,35 +1,145 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+import { useState, useEffect } from 'react';
+import {
+  MantineProvider,
+  AppShell,
+  Button,
+  Group,
+  Text,
+  Tabs,
+  Loader,
+  Container,
+  Stack,
+} from '@mantine/core';
+import { spotifyService, type SpotifyEpisode } from './services/spotifyService';
+import { Login } from './components/Login';
+import { PodcastList } from './components/PodcastList';
+import { StatsDashboard } from './components/StatsDashboard';
+import '@mantine/core/styles.css';
 
 function App() {
-  const [count, setCount] = useState(0)
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [episodes, setEpisodes] = useState<SpotifyEpisode[]>([]);
+  const [activeTab, setActiveTab] = useState<string | null>('podcasts');
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const initialize = async () => {
+      try {
+        await handleAuthCallback();
+        checkAuth();
+      } catch (error) {
+        console.error('App: Error during initialization:', error);
+        setLoading(false);
+      }
+    };
+    initialize();
+  }, []);
+
+  const checkAuth = () => {
+    const authenticated = spotifyService.isAuthenticated();
+    setIsAuthenticated(authenticated);
+    setLoading(false);
+  };
+
+  const handleAuthCallback = async () => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const code = urlParams.get('code');
+    const error = urlParams.get('error');
+
+    if (error) {
+      console.error('Spotify auth error:', error);
+      window.history.replaceState({}, document.title, window.location.pathname);
+      return;
+    }
+
+    if (code) {
+      try {
+        await spotifyService.exchangeCodeForToken(code);
+        setIsAuthenticated(true);
+        window.history.replaceState({}, document.title, window.location.pathname);
+      } catch (err) {
+        console.error('Failed to exchange token:', err);
+      }
+    }
+  };
+
+  const handleLogout = () => {
+    spotifyService.logout();
+    setIsAuthenticated(false);
+    setEpisodes([]);
+    setActiveTab('podcasts');
+  };
+
+  const handleEpisodesLoaded = (loadedEpisodes: SpotifyEpisode[]) => {
+    setEpisodes(loadedEpisodes);
+  };
+
+  if (loading) {
+    return (
+      <MantineProvider>
+        <Container
+          style={{
+            height: '100vh',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <Stack align='center' gap='md'>
+            <Loader size='lg' />
+            <Text>Loading...</Text>
+          </Stack>
+        </Container>
+      </MantineProvider>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <MantineProvider>
+        <Login />
+      </MantineProvider>
+    );
+  }
 
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
-  )
+    <MantineProvider>
+      <AppShell
+        header={{
+          height: 60,
+        }}
+        padding='md'
+      >
+        <AppShell.Header>
+          <Group h='100%' px='md' justify='space-between'>
+            <Text size='xl' fw={700}>
+              PodTrack
+            </Text>
+            <Button onClick={handleLogout} variant='light' color='red'>
+              Logout
+            </Button>
+          </Group>
+        </AppShell.Header>
+
+        <AppShell.Main>
+          <Tabs value={activeTab} onChange={setActiveTab}>
+            <Tabs.List mb='xl'>
+              <Tabs.Tab value='podcasts'>Podcasts</Tabs.Tab>
+              <Tabs.Tab value='stats'>Statistics</Tabs.Tab>
+            </Tabs.List>
+
+            <Tabs.Panel value='podcasts'>
+              <PodcastList onEpisodesLoaded={handleEpisodesLoaded} />
+            </Tabs.Panel>
+
+            <Tabs.Panel value='stats'>
+              <StatsDashboard episodes={episodes} />
+            </Tabs.Panel>
+          </Tabs>
+        </AppShell.Main>
+      </AppShell>
+    </MantineProvider>
+  );
 }
 
-export default App
+export default App;
