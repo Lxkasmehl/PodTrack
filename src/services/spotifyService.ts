@@ -36,14 +36,22 @@ interface SpotifyEpisode {
   progress_ms?: number;
 }
 
-interface RecentlyPlayedResponse {
-  items: Array<{
-    track: SpotifyEpisode & { type?: string };
-    played_at: string;
+interface StoredEpisode extends SpotifyEpisode {
+  total_played_ms: number; // Total time played across all sessions
+  last_played_at: string; // Last time this episode was played
+  first_played_at: string; // First time this episode was played
+  sessions: Array<{
+    started_at: string;
+    ended_at?: string;
+    progress_ms: number;
   }>;
 }
 
 class SpotifyService {
+  private pollingInterval: number | null = null;
+  private readonly POLLING_INTERVAL_MS = 5000; // Poll every 5 seconds
+  private readonly STORAGE_KEY = 'podtrack_episodes';
+
   private getStoredToken(): SpotifyToken | null {
     const stored = localStorage.getItem('spotify_token');
     if (!stored) return null;
@@ -71,6 +79,14 @@ class SpotifyService {
   async exchangeCodeForToken(code: string): Promise<SpotifyToken> {
     const clientSecret = import.meta.env.VITE_SPOTIFY_CLIENT_SECRET;
 
+    if (!clientSecret) {
+      throw new Error('VITE_SPOTIFY_CLIENT_SECRET is not set in environment variables');
+    }
+
+    if (!SPOTIFY_CLIENT_ID) {
+      throw new Error('VITE_SPOTIFY_CLIENT_ID is not set in environment variables');
+    }
+
     // Note: In production, this should be done server-side for security
     // For client-side only, we need to use PKCE flow instead
     const response = await fetch(SPOTIFY_TOKEN_URL, {
@@ -87,7 +103,24 @@ class SpotifyService {
     });
 
     if (!response.ok) {
-      throw new Error('Failed to exchange code for token');
+      const errorText = await response.text();
+      let errorMessage = 'Failed to exchange code for token';
+
+      try {
+        const errorData = JSON.parse(errorText);
+        errorMessage = errorData.error_description || errorData.error || errorMessage;
+        console.error('Spotify token exchange error:', errorData);
+      } catch {
+        console.error('Spotify token exchange error (raw):', errorText);
+      }
+
+      console.error('Request details:', {
+        redirect_uri: REDIRECT_URI,
+        client_id: SPOTIFY_CLIENT_ID,
+        has_client_secret: !!clientSecret,
+      });
+
+      throw new Error(`${errorMessage} (Status: ${response.status})`);
     }
 
     const data: AccessTokenResponse = await response.json();
@@ -175,24 +208,6 @@ class SpotifyService {
     return response;
   }
 
-  async getRecentlyPlayedEpisodes(limit = 50): Promise<SpotifyEpisode[]> {
-    const url = `${SPOTIFY_API_BASE_URL}/me/player/recently-played?limit=${limit}`;
-    const response = await this.fetchWithAuth(url);
-
-    if (!response.ok) {
-      throw new Error('Failed to fetch recently played episodes');
-    }
-
-    const data: RecentlyPlayedResponse = await response.json();
-    // Filter for episodes only and map to our format
-    return data.items
-      .filter((item) => item.track.type === 'episode')
-      .map((item) => ({
-        ...item.track,
-        played_at: item.played_at,
-      }));
-  }
-
   async getUserProfile() {
     const url = `${SPOTIFY_API_BASE_URL}/me`;
     const response = await this.fetchWithAuth(url);
@@ -210,6 +225,220 @@ class SpotifyService {
 
   isAuthenticated(): boolean {
     return this.getStoredToken() !== null;
+  }
+
+  // Get currently playing track/episode
+  async getCurrentlyPlaying(): Promise<any | null> {
+    try {
+      const url = `${SPOTIFY_API_BASE_URL}/me/player?additional_types=episode,track`;
+      const response = await this.fetchWithAuth(url);
+
+      if (response.status === 204) {
+        // No content - nothing is currently playing
+        return null;
+      }
+
+      if (!response.ok) {
+        return null;
+      }
+
+      return await response.json();
+    } catch (error) {
+      console.error('Error fetching currently playing:', error);
+      return null;
+    }
+  }
+
+  // Store episode in localStorage
+  private storeEpisode(episodeData: any, progress_ms: number): void {
+    try {
+      const stored = localStorage.getItem(this.STORAGE_KEY);
+      const episodes: Record<string, StoredEpisode> = stored ? JSON.parse(stored) : {};
+
+      const episodeId = episodeData.id;
+      const now = new Date().toISOString();
+
+      if (episodes[episodeId]) {
+        // Update existing episode
+        const existing = episodes[episodeId];
+        existing.last_played_at = now;
+        existing.progress_ms = progress_ms;
+
+        // Update or add session
+        const currentSession = existing.sessions[existing.sessions.length - 1];
+        if (currentSession && !currentSession.ended_at) {
+          // Update ongoing session
+          currentSession.progress_ms = progress_ms;
+        } else {
+          // Start new session
+          existing.sessions.push({
+            started_at: now,
+            progress_ms: progress_ms,
+          });
+        }
+      } else {
+        // Create new episode entry
+        episodes[episodeId] = {
+          id: episodeData.id,
+          name: episodeData.name,
+          description: episodeData.description || '',
+          duration_ms: episodeData.duration_ms,
+          release_date: episodeData.release_date || '',
+          images: episodeData.images || [],
+          type: episodeData.type || 'episode',
+          show: {
+            id: episodeData.show?.id || '',
+            name: episodeData.show?.name || '',
+            publisher: episodeData.show?.publisher || '',
+            images: episodeData.show?.images || [],
+          },
+          played_at: now,
+          progress_ms: progress_ms,
+          total_played_ms: 0,
+          last_played_at: now,
+          first_played_at: now,
+          sessions: [
+            {
+              started_at: now,
+              progress_ms: progress_ms,
+            },
+          ],
+        };
+      }
+
+      localStorage.setItem(this.STORAGE_KEY, JSON.stringify(episodes));
+    } catch (error) {
+      console.error('Error storing episode:', error);
+    }
+  }
+
+  // Update session when playback stops
+  private updateSessionEnd(episodeId: string): void {
+    try {
+      const stored = localStorage.getItem(this.STORAGE_KEY);
+      if (!stored) return;
+
+      const episodes: Record<string, StoredEpisode> = JSON.parse(stored);
+      const episode = episodes[episodeId];
+
+      if (episode) {
+        const lastSession = episode.sessions[episode.sessions.length - 1];
+        if (lastSession && !lastSession.ended_at) {
+          const now = new Date().toISOString();
+          lastSession.ended_at = now;
+
+          // Calculate total played time
+          episode.total_played_ms = episode.sessions.reduce((total, session) => {
+            if (session.ended_at) {
+              const start = new Date(session.started_at).getTime();
+              const end = new Date(session.ended_at).getTime();
+              return total + (end - start);
+            }
+            return total + session.progress_ms;
+          }, 0);
+
+          localStorage.setItem(this.STORAGE_KEY, JSON.stringify(episodes));
+        }
+      }
+    } catch (error) {
+      console.error('Error updating session end:', error);
+    }
+  }
+
+  // Get stored episodes
+  private getStoredEpisodes(): StoredEpisode[] {
+    try {
+      const stored = localStorage.getItem(this.STORAGE_KEY);
+      if (!stored) return [];
+
+      const episodes: Record<string, StoredEpisode> = JSON.parse(stored);
+      return Object.values(episodes).sort(
+        (a, b) =>
+          new Date(b.last_played_at).getTime() - new Date(a.last_played_at).getTime()
+      );
+    } catch (error) {
+      console.error('Error getting stored episodes:', error);
+      return [];
+    }
+  }
+
+  // Start polling for currently playing content
+  startPlaybackTracking(): void {
+    if (this.pollingInterval) {
+      return; // Already polling
+    }
+
+    let lastEpisodeId: string | null = null;
+
+    this.pollingInterval = window.setInterval(async () => {
+      try {
+        const playback = await this.getCurrentlyPlaying();
+
+        if (!playback || !playback.item) {
+          // Nothing playing - end session if there was one
+          if (lastEpisodeId) {
+            this.updateSessionEnd(lastEpisodeId);
+            lastEpisodeId = null;
+          }
+          return;
+        }
+
+        const item = playback.item;
+        const isEpisode = item.type === 'episode';
+
+        if (isEpisode) {
+          const progress_ms = playback.progress_ms || 0;
+          this.storeEpisode(item, progress_ms);
+
+          // Track if episode changed
+          if (lastEpisodeId && lastEpisodeId !== item.id) {
+            this.updateSessionEnd(lastEpisodeId);
+          }
+          lastEpisodeId = item.id;
+        } else {
+          // If playing a track, end any ongoing episode session
+          if (lastEpisodeId) {
+            this.updateSessionEnd(lastEpisodeId);
+            lastEpisodeId = null;
+          }
+        }
+      } catch (error) {
+        console.error('Error in playback tracking:', error);
+      }
+    }, this.POLLING_INTERVAL_MS);
+  }
+
+  // Stop polling
+  stopPlaybackTracking(): void {
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+      this.pollingInterval = null;
+    }
+  }
+
+  // Replace the old getRecentlyPlayedEpisodes to use stored data
+  async getRecentlyPlayedEpisodes(limit = 50): Promise<SpotifyEpisode[]> {
+    // Get episodes from local storage
+    const storedEpisodes = this.getStoredEpisodes();
+
+    // Convert StoredEpisode to SpotifyEpisode format
+    return storedEpisodes.slice(0, limit).map((stored) => ({
+      id: stored.id,
+      name: stored.name,
+      description: stored.description,
+      duration_ms: stored.duration_ms,
+      release_date: stored.release_date,
+      images: stored.images,
+      type: stored.type,
+      show: stored.show,
+      played_at: stored.last_played_at,
+      progress_ms: stored.progress_ms,
+    }));
+  }
+
+  // Clear stored episodes (useful for testing or cleanup)
+  clearStoredEpisodes(): void {
+    localStorage.removeItem(this.STORAGE_KEY);
   }
 }
 

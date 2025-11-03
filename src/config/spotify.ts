@@ -8,6 +8,7 @@ export const SPOTIFY_TOKEN_URL = 'https://accounts.spotify.com/api/token';
 // Scopes needed for the app
 export const SPOTIFY_SCOPES = [
   'user-read-recently-played',
+  'user-read-playback-state', // For tracking currently playing episodes
   'user-read-private',
   'user-read-email',
   'user-top-read',

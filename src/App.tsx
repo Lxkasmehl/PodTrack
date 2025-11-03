@@ -35,6 +35,19 @@ function App() {
     initialize();
   }, []);
 
+  useEffect(() => {
+    if (isAuthenticated) {
+      // Start tracking playback when authenticated
+      spotifyService.startPlaybackTracking();
+      console.log('Started playback tracking');
+    }
+
+    // Cleanup on unmount or when authentication changes
+    return () => {
+      spotifyService.stopPlaybackTracking();
+    };
+  }, [isAuthenticated]);
+
   const checkAuth = () => {
     const authenticated = spotifyService.isAuthenticated();
     setIsAuthenticated(authenticated);
@@ -46,9 +59,11 @@ function App() {
     const code = urlParams.get('code');
     const error = urlParams.get('error');
 
+    // Always clear URL parameters after reading them
+    window.history.replaceState({}, document.title, window.location.pathname);
+
     if (error) {
       console.error('Spotify auth error:', error);
-      window.history.replaceState({}, document.title, window.location.pathname);
       return;
     }
 
@@ -56,14 +71,16 @@ function App() {
       try {
         await spotifyService.exchangeCodeForToken(code);
         setIsAuthenticated(true);
-        window.history.replaceState({}, document.title, window.location.pathname);
       } catch (err) {
         console.error('Failed to exchange token:', err);
+        // Clear any stored tokens if exchange fails
+        spotifyService.logout();
       }
     }
   };
 
   const handleLogout = () => {
+    spotifyService.stopPlaybackTracking();
     spotifyService.logout();
     setIsAuthenticated(false);
     setEpisodes([]);

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Stack,
   Card,
@@ -27,24 +27,27 @@ export function PodcastList({ onEpisodesLoaded }: PodcastListProps) {
   const [error, setError] = useState<string | null>(null);
   const [categories, setCategories] = useState<Category[]>([]);
 
-  useEffect(() => {
-    loadEpisodes();
-    loadCategories();
-  }, []);
-
-  const loadEpisodes = async () => {
+  const loadEpisodes = useCallback(async () => {
     try {
       setLoading(true);
+      setError(null);
       const data = await spotifyService.getRecentlyPlayedEpisodes(50);
+      console.log('Loaded episodes:', data.length);
       setEpisodes(data);
       onEpisodesLoaded(data);
-      setError(null);
     } catch (err) {
+      console.error('Error loading episodes:', err);
       setError(err instanceof Error ? err.message : 'Failed to load podcasts');
     } finally {
       setLoading(false);
     }
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    loadEpisodes();
+    loadCategories();
+  }, [loadEpisodes]);
 
   const loadCategories = () => {
     setCategories(categoryService.getCategories());
@@ -95,6 +98,24 @@ export function PodcastList({ onEpisodesLoaded }: PodcastListProps) {
       <Container size='lg' mt='xl'>
         <Alert icon={<IconInfoCircle />} title='Error' color='red'>
           {error}
+        </Alert>
+      </Container>
+    );
+  }
+
+  if (episodes.length === 0 && !loading) {
+    return (
+      <Container size='lg' mt='xl'>
+        <Alert icon={<IconInfoCircle />} title='No Podcasts Found' color='blue'>
+          <Text mb='sm'>
+            You haven't played any podcast episodes recently. The Spotify API only shows
+            items you've recently played, and it looks like you've been listening to music
+            (tracks) instead of podcasts.
+          </Text>
+          <Text size='sm' c='dimmed'>
+            To see podcasts here, play some podcast episodes on Spotify. They will appear
+            in your recently played history.
+          </Text>
         </Alert>
       </Container>
     );
