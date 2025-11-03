@@ -43,14 +43,15 @@ export class StatsService {
       categoryNames[cat.id] = cat.name;
     });
 
-    // Calculate listening time per category
+    // Calculate listening time per category using actual played time
     episodes.forEach((episode) => {
       const categoryId = categoryService.getCategoryForPodcast(episode.show.id);
 
       if (categoryId) {
-        const durationMinutes = Math.floor(episode.duration_ms / 60000);
-        categoryMinutes[categoryId] =
-          (categoryMinutes[categoryId] || 0) + durationMinutes;
+        // Use total_played_ms if available (actual listening time), otherwise fall back to progress_ms
+        const playedMs = episode.total_played_ms || episode.progress_ms || 0;
+        const playedMinutes = Math.floor(playedMs / 60000);
+        categoryMinutes[categoryId] = (categoryMinutes[categoryId] || 0) + playedMinutes;
       }
     });
 
@@ -88,7 +89,9 @@ export class StatsService {
     const totalMinutes = episodes.reduce((sum, episode) => {
       const categoryId = categoryService.getCategoryForPodcast(episode.show.id);
       if (categoryId) {
-        return sum + Math.floor(episode.duration_ms / 60000);
+        // Use total_played_ms if available (actual listening time), otherwise fall back to progress_ms
+        const playedMs = episode.total_played_ms || episode.progress_ms || 0;
+        return sum + Math.floor(playedMs / 60000);
       }
       return sum;
     }, 0);

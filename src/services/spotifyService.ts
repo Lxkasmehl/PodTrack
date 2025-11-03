@@ -34,6 +34,7 @@ interface SpotifyEpisode {
   };
   played_at?: string;
   progress_ms?: number;
+  total_played_ms?: number; // Total time actually listened to
 }
 
 interface StoredEpisode extends SpotifyEpisode {
@@ -49,8 +50,10 @@ interface StoredEpisode extends SpotifyEpisode {
 
 class SpotifyService {
   private pollingInterval: number | null = null;
-  private readonly POLLING_INTERVAL_MS = 5000; // Poll every 5 seconds
+  private readonly POLLING_INTERVAL_MS = 10000; // Poll every 10 seconds (as requested)
   private readonly STORAGE_KEY = 'podtrack_episodes';
+  private lastPollTime: number = 0;
+  private lastEpisodeId: string | null = null;
 
   private getStoredToken(): SpotifyToken | null {
     const stored = localStorage.getItem('spotify_token');
@@ -250,7 +253,11 @@ class SpotifyService {
   }
 
   // Store episode in localStorage
-  private storeEpisode(episodeData: any, progress_ms: number): void {
+  private storeEpisode(
+    episodeData: any,
+    progress_ms: number,
+    timePlayedMs: number
+  ): void {
     try {
       const stored = localStorage.getItem(this.STORAGE_KEY);
       const episodes: Record<string, StoredEpisode> = stored ? JSON.parse(stored) : {};
@@ -262,19 +269,37 @@ class SpotifyService {
         // Update existing episode
         const existing = episodes[episodeId];
         existing.last_played_at = now;
-        existing.progress_ms = progress_ms;
+        existing.progress_ms = Math.min(
+          progress_ms,
+          episodeData.duration_ms || existing.duration_ms
+        );
 
         // Update or add session
         const currentSession = existing.sessions[existing.sessions.length - 1];
         if (currentSession && !currentSession.ended_at) {
-          // Update ongoing session
-          currentSession.progress_ms = progress_ms;
+          // Update ongoing session - add the time played since last poll
+          // Don't exceed episode duration
+          const maxProgress = episodeData.duration_ms || existing.duration_ms;
+          currentSession.progress_ms = Math.min(progress_ms, maxProgress);
+
+          // Add time listened (but don't exceed episode duration)
+          existing.total_played_ms = Math.min(
+            (existing.total_played_ms || 0) + timePlayedMs,
+            maxProgress
+          );
         } else {
           // Start new session
           existing.sessions.push({
             started_at: now,
             progress_ms: progress_ms,
           });
+
+          // Add initial time
+          const maxProgress = episodeData.duration_ms || existing.duration_ms;
+          existing.total_played_ms = Math.min(
+            (existing.total_played_ms || 0) + timePlayedMs,
+            maxProgress
+          );
         }
       } else {
         // Create new episode entry
@@ -293,8 +318,8 @@ class SpotifyService {
             images: episodeData.show?.images || [],
           },
           played_at: now,
-          progress_ms: progress_ms,
-          total_played_ms: 0,
+          progress_ms: Math.min(progress_ms, episodeData.duration_ms || 0),
+          total_played_ms: Math.min(timePlayedMs, episodeData.duration_ms || 0),
           last_played_at: now,
           first_played_at: now,
           sessions: [
@@ -313,7 +338,7 @@ class SpotifyService {
   }
 
   // Update session when playback stops
-  private updateSessionEnd(episodeId: string): void {
+  private updateSessionEnd(episodeId: string, finalTimeMs: number): void {
     try {
       const stored = localStorage.getItem(this.STORAGE_KEY);
       if (!stored) return;
@@ -327,15 +352,12 @@ class SpotifyService {
           const now = new Date().toISOString();
           lastSession.ended_at = now;
 
-          // Calculate total played time
-          episode.total_played_ms = episode.sessions.reduce((total, session) => {
-            if (session.ended_at) {
-              const start = new Date(session.started_at).getTime();
-              const end = new Date(session.ended_at).getTime();
-              return total + (end - start);
-            }
-            return total + session.progress_ms;
-          }, 0);
+          // Add final time to total
+          const maxProgress = episode.duration_ms || 0;
+          episode.total_played_ms = Math.min(
+            (episode.total_played_ms || 0) + finalTimeMs,
+            maxProgress
+          );
 
           localStorage.setItem(this.STORAGE_KEY, JSON.stringify(episodes));
         }
@@ -368,38 +390,53 @@ class SpotifyService {
       return; // Already polling
     }
 
-    let lastEpisodeId: string | null = null;
+    this.lastPollTime = Date.now();
+    this.lastEpisodeId = null;
 
     this.pollingInterval = window.setInterval(async () => {
       try {
+        const now = Date.now();
+        const timeSinceLastPoll = now - this.lastPollTime;
+        this.lastPollTime = now;
+
         const playback = await this.getCurrentlyPlaying();
 
         if (!playback || !playback.item) {
           // Nothing playing - end session if there was one
-          if (lastEpisodeId) {
-            this.updateSessionEnd(lastEpisodeId);
-            lastEpisodeId = null;
+          if (this.lastEpisodeId) {
+            this.updateSessionEnd(this.lastEpisodeId, timeSinceLastPoll);
+            this.lastEpisodeId = null;
           }
           return;
         }
 
         const item = playback.item;
         const isEpisode = item.type === 'episode';
+        const isPlaying = playback.is_playing === true;
 
-        if (isEpisode) {
+        if (isEpisode && isPlaying) {
           const progress_ms = playback.progress_ms || 0;
-          this.storeEpisode(item, progress_ms);
 
           // Track if episode changed
-          if (lastEpisodeId && lastEpisodeId !== item.id) {
-            this.updateSessionEnd(lastEpisodeId);
+          if (this.lastEpisodeId && this.lastEpisodeId !== item.id) {
+            // Previous episode ended
+            this.updateSessionEnd(this.lastEpisodeId, timeSinceLastPoll);
           }
-          lastEpisodeId = item.id;
+
+          // Update current episode with time listened
+          this.storeEpisode(item, progress_ms, timeSinceLastPoll);
+          this.lastEpisodeId = item.id;
+        } else if (isEpisode && !isPlaying) {
+          // Episode is paused - don't accumulate time
+          if (this.lastEpisodeId === item.id) {
+            // Same episode, just paused - don't update
+            return;
+          }
         } else {
-          // If playing a track, end any ongoing episode session
-          if (lastEpisodeId) {
-            this.updateSessionEnd(lastEpisodeId);
-            lastEpisodeId = null;
+          // If playing a track or not an episode, end any ongoing episode session
+          if (this.lastEpisodeId) {
+            this.updateSessionEnd(this.lastEpisodeId, timeSinceLastPoll);
+            this.lastEpisodeId = null;
           }
         }
       } catch (error) {
@@ -433,6 +470,7 @@ class SpotifyService {
       show: stored.show,
       played_at: stored.last_played_at,
       progress_ms: stored.progress_ms,
+      total_played_ms: stored.total_played_ms,
     }));
   }
 
